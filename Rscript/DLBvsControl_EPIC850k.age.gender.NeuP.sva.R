@@ -9,9 +9,6 @@
 # 
 # http://rnbeads.mpi-inf.mpg.de/
 ################################################################################
-## module load mugqic/R_Bioconductor/3.5.0_3.7 ## install on personal space
-## module load mugqic/ghostscript/8.70  
-################################################################################
 # (0) Preliminaries
 ################################################################################
 # load the package
@@ -26,11 +23,7 @@ resultDir <- file.path(getwd(), "results")
 datasetDir <- file.path(dataDir, "DBLvsHealth")
 idatDir <- file.path(datasetDir, "idat")
 sampleSheet <- file.path(datasetDir, "sample_annotation_DLBonly.age.gender.NeuN.csv")
-reportDir <- file.path(resultDir, "Stewart_DLBvsControl_age_gender_NeuN_sva")
-### given the batch is completely overlapped with the case-control variable, 
-### we have to remove the batch effect variable. However, as batch effect might be a potential confounder,
-### we tried to use sva to infer&remove unwanted variance.
-
+reportDir <- file.path(resultDir, "DLBvsControl_age_gender_NeuN_sva")
 ################################################################################
 # (1) Set analysis options
 ################################################################################
