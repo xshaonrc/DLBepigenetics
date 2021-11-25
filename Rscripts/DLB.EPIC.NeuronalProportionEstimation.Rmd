@@ -1,0 +1,90 @@
+---
+title: "DLB.EPIC.neuronalPropotionEstimation.Rmd"
+author: "Xiaojian Shao"
+date: "02/10/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load packages}
+# load packages required for analysis
+library(knitr)
+library(limma)
+library(minfi)
+library(IlluminaHumanMethylationEPICmanifest)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(RColorBrewer)
+library(missMethyl)
+library(minfiData)
+library(Gviz)
+library(DMRcate)
+library(stringr)
+```
+
+```{r get EPIC annotation data}
+# get the EPIC annotation data
+annEPIC <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+head(annEPIC)
+```
+
+```{r load data}
+# set up a path to the data directory
+dataDirectory <- "./data/DBLvsHealth/idat/"
+# list the files
+list.files(dataDirectory, recursive = TRUE)
+```
+
+```{r read samplesheet, echo=FALSE}
+# read in the sample sheet for the experiment
+targets <- read.metharray.sheet(dataDirectory, pattern="SampleSheet.csv")
+targets
+```
+
+```{r read raw iDAT data}
+# read in the raw data from the IDAT files
+# it may take couple of minutes (~5 minuts)
+start_time <- Sys.time()
+rgSet <- read.metharray.exp(targets=targets)
+rgSet
+Sys.time() - start_time
+
+# give the samples descriptive names
+sampleNames(rgSet) <- targets$Sample_Name
+rgSet
+
+```
+```{r estimateCellCounts for front cotex}
+
+rgSet450K <- convertArray(rgSet,
+                  outType = c("IlluminaHumanMethylation450k"),
+                  verbose = TRUE)
+
+library(ExperimentHub)  
+library(FlowSorted.Blood.450k)
+
+# countsEPIC_N <-estimateCellCounts2(rgSet, compositeCellType = "DLPFC",   
+#                                 processMethod = "preprocessNoob",  
+#                                 probeSelect = "IDOL",  
+#                                 cellTypes = c("NeuN_neg", "NeuN_pos"),  
+#                                 referencePlatform =   
+#                                 "IlluminaHumanMethylation450k",  
+#                                 referenceset = NULL,
+#                                 meanPlot = TRUE, 
+#                                 IDOLOptimizedCpGs =NULL,   
+#                                 returnAll = FALSE)  
+
+## estimate the Neuronal proportion using the R function estimateCellCounts
+## in the minfi library, with converting the EPIC data to 450K data.
+
+DLB_NeuN_counts_450K <- estimateCellCounts(rgSet450K, compositeCellType = "DLPFC",   
+                              processMethod = "preprocessNoob", 
+                             cellTypes = c("NeuN_neg", "NeuN_pos"), 
+                             referencePlatform =   
+                                "IlluminaHumanMethylation450k",  
+                             meanPlot = FALSE)
+
+DLB_NeuN_counts_450K
+```
