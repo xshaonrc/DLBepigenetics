@@ -1,0 +1,1253 @@
+---
+title: "DLB_Epigenome_EPIC.Rmd"
+author: "Xiaojian Shao"
+date: "02/01/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# set up working directory
+knitr::opts_knit$set(root.dir = '~/Documents/AgingInPlace/DLBproject/missMethyl/')
+```
+
+# DNA methylation analysis of DLB patients
+
+The report focus on performing the differential DNA methylation analysis on DLB patients using Minfi and DMRcate. Specifically, the whole-genome wide DNA methylation profiles (with Illumina BeadChip EPIC assay) of 15 DLB patients and 16 matched controls were compared. DMPs were detected using limma adjusting for age, sex, PMI, estimated neuronal proportion, and top three PCs build from the negative control probes. Differentially methylated regions (DMRs) were inferred using DMRcate via kernel smoothing.
+
+Load the R packages that are likely to be required.
+```{r load packages}
+# load packages required for analysis
+library(knitr)
+library(limma)
+library(minfi)
+library(minfiData)
+library(IlluminaHumanMethylationEPICmanifest)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(RColorBrewer)
+library(missMethyl)
+library(Gviz)
+library(DMRcate)
+library(stringr)
+library(ggplot2)
+library(qqman)
+```
+
+```{r get EPIC annotation data}
+# get the EPIC annotation data
+annEPIC <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+#head(annEPIC)
+dim(annEPIC)
+```
+
+## Loading the DLB EPIC data
+```{r load data}
+# set up a path to the data directory
+dataDirectory <- "./data/"
+# list the files
+#list.files(dataDirectory, recursive = TRUE)
+```
+
+```{r read samplesheet}
+# read in the sample sheet for the experiment
+targets <- read.metharray.sheet(dataDirectory, pattern="SampleSheet.csv")
+
+targets$Age <- targets$Age/100
+targets$PMI <- targets$PMI/100
+nCtrl <- sum(targets$Sample_Group == "Ctrl")
+nDLB <- sum(targets$Sample_Group == "DLB")
+targets$Public_Name <- c(paste0("Control", c(1:nCtrl)), paste0("DLB", c(1:nDLB)))
+
+```
+
+```{r read raw iDAT data}
+# read in the raw data from the IDAT files
+# it may take couple of minutes (~5 minutes)
+start_time <- Sys.time()
+rgSet <- read.metharray.exp(targets=targets)
+rgSet
+dim(rgSet)
+Sys.time() - start_time
+
+# give the samples descriptive names
+sampleNames(rgSet) <- targets$Public_Name
+#rgSet
+
+manifest <- getManifest(rgSet)
+#manifest
+
+```
+
+### Neuronal proportion estimation
+```{r estimateCellCounts for front cotex}
+library(ExperimentHub)
+library(FlowSorted.Blood.450k)
+library(FlowSorted.Blood.EPIC)
+
+# countsEPIC_N <-estimateCellCounts2(rgSet, compositeCellType = "DLPFC",
+#                                 processMethod = "preprocessNoob",
+#                                 probeSelect = "IDOL",
+#                                 cellTypes = c("NeuN_neg", "NeuN_pos"),
+#                                 referencePlatform =
+#                                 "IlluminaHumanMethylationEPIC",
+#                                 referenceset = NULL,
+#                                 meanPlot = TRUE,
+#                                 IDOLOptimizedCpGs =NULL,
+#                                 returnAll = FALSE)
+#
+#
+### Loading required package: FlowSorted.DLPFC.EPIC
+# Error in estimateCellCounts2(rgSet, compositeCellType = "DLPFC", processMethod = "preprocessNoob",  : 
+#   Could not find reference data package for compositeCellType 'DLPFC' and referencePlatform 'EPIC' (inferred package name is 'FlowSorted.DLPFC.EPIC')
+# In addition: Warning message:
+# In library(package, lib.loc = lib.loc, character.only = TRUE, logical.return = TRUE,  :
+#   there is no package called 'FlowSorted.DLPFC.EPIC'
+
+
+## estimate the Neuronal proportion using the R function estimateCellCounts
+## in the minfi library, with converting the EPIC data to 450K data.
+DLB_NeuN_counts_noob <- estimateCellCounts(rgSet, compositeCellType = "DLPFC",   
+                              processMethod = "preprocessNoob", 
+                             cellTypes = c("NeuN_neg", "NeuN_pos"), 
+                             referencePlatform =   
+                                "IlluminaHumanMethylation450k",  
+                             meanPlot = FALSE)
+
+targets$NeuN_neg_noob <- DLB_NeuN_counts_noob[,"NeuN_neg"]
+targets$NeuN_pos_noob <- DLB_NeuN_counts_noob[,"NeuN_pos"]
+
+```
+
+## Quality Control
+
+```{r Quality Control}
+# calculate the detection p-values
+start_time <- Sys.time()
+detP <- detectionP(rgSet)
+#head(detP)
+Sys.time() - start_time
+dim(detP)
+
+```
+
+```{r remove poor quality samples}
+
+# remove poor quality samples
+keep <- colMeans(detP) < 0.05
+rgSet <- rgSet[,keep]
+#rgSet
+
+# remove poor quality samples from targets data
+targets <- targets[keep,]
+#targets[,1:5]
+
+# remove poor quality samples from detection p-value table
+detP <- detP[,keep]
+dim(detP)
+```
+
+## Normalisation
+
+To minimize the unwanted variation within and between samples, various data normalisations can be applied. Although there is no single normalisation method that is universally considered best, a recent study by Fortin et al. (2014) has suggested that a good rule of thumb within the minfi framework is that the preprocessFunnorm (Fortin et al. 2014) function is most appropriate for datasets with global methylation differences such as cancer/normal or vastly different tissue types, whilst the preprocessQuantile function (Touleimat and Tost 2012) is more suited for datasets where you do not expect global differences between your samples, for example a single tissue. Further discussion on appropriate choice of normalisation can be found in (Hicks and Irizarry 2015), and the accompanying quantro package includes data-driven tests for the assumptions of quantile normalisation.
+
+```{r Normalisation}
+# normalize the data; this results in a GenomicRatioSet object
+# obtain mappable CpGs
+start_time <- Sys.time()
+mSetFn <- preprocessFunnorm(rgSet) 
+Sys.time() - start_time
+```
+
+## Global signal intensity 
+```{r qc global signal intensity check up}
+## Signal intensity check of both methylated and unmethylated channels. 
+mSetRaw <- preprocessRaw(rgSet)
+qc <- getQC(mSetRaw)
+#head(qc)
+plotQC(qc)
+```
+
+## Sex prediction 
+```{r get sex prediction}
+## use sex chromosome to predict the sex of samples.
+RSet <- ratioConvert(mSetRaw, what = "both", keepCN = TRUE)
+#RSet
+
+GRset <- mapToGenome(RSet)
+#GRset
+
+gr <- granges(GRset)
+#head(gr, n= 3)
+
+annotation <- getAnnotation(GRset)
+#names(annotation)
+
+estSex <- getSex(GRset, cutoff = -2)
+predictedSex <- estSex$predictedSex
+head(predictedSex)
+GRset <- addSex(GRset, sex = estSex)
+
+plotSex(GRset, id=targets$Public_Name)
+
+```
+
+## getSnpBeta
+
+The array contains by design 65 probes that are not meant to interrogate methylation status, but instead are designed to interrogate SNPs. By default, minfi drops these probes. The function getSnpBeta allows the user to extract the Beta values for those probes from an RGChannelSet. The return object is a matrix with the columns being the samples and the rows being the different SNP probes:
+
+```{r get SNP and perform hierarchical clustering}
+
+# GET SNP beta profile
+snps <- getSnpBeta(rgSet)
+head(snps)
+
+dist_snp_euc <- dist(t(as.matrix(snps)), method = 'euclidean')
+#snp_hclust_ward <- hclust(dist_snp_euc, method = "ward.D2" )
+snp_hclust_ward <- hclust(dist_snp_euc, method = "ward" )
+
+plot(snp_hclust_ward)
+
+```
+
+## Filtering probes
+
+```{r detailed probe filters}
+# ensure probes are in the same order in the mSetFn and detP objects
+detP <- detP[match(featureNames(mSetFn),rownames(detP)),] 
+## mSetFn is the mset that contains CpGs mappable to the genome.
+
+#Poor quality probes can be filtered out based on the detection p-value. For this example, to retain a CpG for further analysis, we require that the detection p-value is less than 0.01 in all samples.
+# remove any probes that have failed in one or more samples
+keep <- rowSums(detP < 0.01) == ncol(mSetFn) 
+table(keep)
+
+mSetFnFlt <- mSetFn[keep,]
+#mSetFnFlt
+# remove bad quality probes : 10841
+
+mSetFn.noSNPs <- dropLociWithSnps(mSetFnFlt)
+# remove SNP overlapped CpGs: 28260
+
+dim(mSetFn.noSNPs )
+
+getAnnotationObject(mSetFn.noSNPs)
+# exclude cross reactive probes 
+xReactiveProbes <- read.csv(file=paste(dataDirectory,
+                                       "43254-non-specific-probes-IlluminaEPIC.csv",
+                                       sep="/"), stringsAsFactors=FALSE)
+
+keep <- !(featureNames(mSetFn.noSNPs ) %in% xReactiveProbes$TargetID)
+table(keep)
+mSetFn.noSNPs_noCR <- mSetFn.noSNPs [keep,]
+## remove cross-activities probes : 40565
+
+# remove any probes that within the non-CpG contexts : [CA], [CC], [CT]
+CAlist <- grepl("\\[CA\\]",annEPIC$Forward_Sequence )
+CClist <- grepl("\\[CC\\]",annEPIC$Forward_Sequence )
+CTlist <- grepl("\\[CT\\]",annEPIC$Forward_Sequence )
+
+keep <- !(featureNames(mSetFn.noSNPs_noCR ) %in% annEPIC$Name[CAlist | CClist | CTlist])
+table(keep)
+mSetFn.noSNPs_noCR_noCpH  <- mSetFn.noSNPs_noCR[keep,]
+## remove non-CpG probes : 2576
+
+# if your data includes males and females, remove probes on the sex chromosomes
+keep <- !(featureNames(mSetFn.noSNPs_noCR_noCpH ) %in% annEPIC$Name[annEPIC$chr %in% 
+                                                        c("chrX","chrY")])
+table(keep)
+mSetFn.noSNPs_noCR_noXY  <- mSetFn.noSNPs_noCR_noCpH[keep,]
+## remove sex chromosome probes : 17209
+
+dim(mSetFn.noSNPs_noCR_noXY)
+```
+
+## Get M values and beta values
+We need to calculate M-values and beta values. As previously mentioned, M-values have nicer statistical properties and are thus better for use in statistical analysis of methylation data whilst beta values are easy to interpret and are thus better for displaying data. A detailed comparison of M-values and beta values was published by Du et al. (2010).
+
+```{r M-values}
+
+# calculate M-values for statistical analysis
+mVals <- getM(mSetFn.noSNPs_noCR_noXY)
+
+bVals <- ilogit2(mVals)
+
+dim(mVals)
+idx <- is.infinite(mVals)
+nInfiniteSamples <- rowSums(idx)
+
+mVals <- mVals[nInfiniteSamples==0,] # remove probes contains missing data
+bVals <- bVals[nInfiniteSamples==0,]
+dim(mVals)
+
+par(mfrow=c(1,2))
+densityPlot(bVals, sampGroups=targets$Sample_Group, main="Beta values", 
+            legend=FALSE, xlab="Beta values")
+legend("top", legend = levels(factor(targets$Sample_Group)), 
+       text.col=brewer.pal(8,"Dark2"))
+densityPlot(mVals, sampGroups=targets$Sample_Group, main="M-values", 
+            legend=FALSE, xlab="M values")
+legend("topleft", legend = levels(factor(targets$Sample_Group)), 
+       text.col=brewer.pal(8,"Dark2"))
+```
+
+## PCA analysis on negative control probes 
+```{r INCs PCA anlaysis}
+library(ggfortify)
+## plot PCA on the Illumina negative controls sets
+INCs <- getINCs(rgSet)
+
+meth_INCsPCA <- prcomp(t(INCs), scale. = TRUE)
+
+summary(meth_INCsPCA)
+
+## scree plot
+plot(1:ncol(INCs),summary(meth_INCsPCA) $importance[2,], 
+     xlab="Principal Component",
+     ylab="Proportion of Variance Explained",
+     main="Negative controls probes",
+     pch=19,
+     type="b")
+
+plot(1:ncol(INCs),summary(meth_INCsPCA) $importance[3,], 
+     xlab="Principal Component",
+     ylab="Cumulative Proportion of Variance Explained",
+     main="Negative controls probes",
+     pch=19,
+     type="b")
+
+
+rownames(targets) <- targets$Public_Name
+targets$Gender <- as.factor(targets$Gender)
+targets$Slide <- as.factor(targets$Slide)
+targets$Array <- as.factor(targets$Array)
+
+autoplot(meth_INCsPCA,         
+         data = targets,
+         colour = 'Sample_Group',
+         label = TRUE)
+
+autoplot(meth_INCsPCA,         
+         data = targets,
+         colour = 'Slide',
+         label = TRUE)
+
+PhenokruskalSet <- colnames(targets)[c(5:6)] ## 2 features
+
+nKruskal <- 2;
+n <- 10 # n top PCs
+PCvsPhenoAssocStats <- matrix(0,n,nKruskal)
+PCvsPhenoAssocPv <- matrix(0,n,nKruskal)
+
+for (i in 1:n) {
+  PC <- meth_INCsPCA$x[,i]
+  for (j in 1:nKruskal){
+    res <- kruskal.test(PC ~ targets[,PhenokruskalSet[j]])
+    PCvsPhenoAssocStats[i,j] <- res$statistic
+    PCvsPhenoAssocPv[i,j] <- res$p.value
+  }
+}
+colnames(PCvsPhenoAssocStats) <- PhenokruskalSet
+colnames(PCvsPhenoAssocPv) <- PhenokruskalSet
+rownames(PCvsPhenoAssocStats) <-paste("PC",1:n,sep="")
+rownames(PCvsPhenoAssocPv) <-paste("PC",1:n,sep="")
+
+print(PCvsPhenoAssocStats)
+print(PCvsPhenoAssocPv)
+```
+
+## Probe-wise differential methylation analysis
+For the association models, we need to explore a method that will correct the confounding at the global effect level, rather than at the probe-based level. Here we tried the negative control probes based PCA analysis which might reflect the global batch effects.
+
+## Model1 : M-value based DMC analysis
+```{r model 1: INCPCs + NeuN_noob}
+# this is the factor of interest
+DLBCtrl <- factor(targets$Sample_Group)
+
+nPCs <- 3
+INCPCs <- meth_INCsPCA$x[,1:nPCs] # from the scree plot, let's pick the top 3 INC PCs.
+
+pheno <- cbind(targets, INCPCs)
+colnames(pheno) <- c(colnames(targets), paste("INCPCs", c(1:nPCs), sep=""))
+INCPCs <- as.matrix(INCPCs)
+
+# use the above to create a design matrix
+design <- model.matrix(~ 0 + DLBCtrl + Age + Gender + PMI  + NeuN_pos_noob + NeuN_neg_noob + INCPCs, data = pheno)
+
+# fit the linear model 
+model1.fit <- lmFit(mVals, design) # use mVals from Fun normalization
+
+# create a contrast matrix for specific comparisons
+contMatrix <- makeContrasts(DLBCtrlDLB - DLBCtrlCtrl ,
+                           levels=design)
+contMatrix
+
+# fit the contrasts
+start_time <- Sys.time()
+model1.fit2 <- contrasts.fit(model1.fit, contMatrix)
+model1.fit2 <- eBayes(model1.fit2)
+Sys.time() - start_time
+
+# look at the numbers of DM CpGs at FDR < 0.05 
+summary(decideTests(model1.fit2, p.value=0.05))
+
+## calculate the genomic inflation lambdagc
+chisq <- qchisq(1-model1.fit2 $p.value,1)
+lambdagc <- round(median(chisq)/qchisq(0.5,1),2)
+lambdagc
+
+# get the table of results for the first contrast (DLB - Ctrl)
+annEPICSub <- annEPIC[match(rownames(mVals),annEPIC$Name),
+                      c(1:4,12:19,24:ncol(annEPIC))]
+M1DMPs <- topTable(model1.fit2, num=Inf, coef=1, genelist=annEPICSub)
+head(M1DMPs)
+sum(M1DMPs$P.Value <9e-8)
+sum(M1DMPs$P.Value <1e-5)
+
+## manhattan plot
+library(qqman)
+CHR <- M1DMPs$chr
+CHR <-  gsub("^.{0,3}", "", CHR)
+CHR <- as.numeric(CHR)
+CpGpvalue <-
+  data.frame(
+    SNP = M1DMPs$Name,
+    CHR = CHR,
+    BP = M1DMPs$pos,
+    P = M1DMPs$P.Value
+  )
+colnames(CpGpvalue)=c("SNP", "CHR", "BP","P")
+
+qq(model1.fit2$p.value, col = "blue4",cex = 0.8, las = 1, main = "Q-Q plot of association p-values")
+
+qv0.1pv <- max(M1DMPs$P.Value[M1DMPs$adj.P.Val<0.1])
+qv0.05pv <- max(M1DMPs$P.Value[M1DMPs$adj.P.Val<0.05])
+
+suggestivelinelogpv <- -log10(qv0.05pv) 
+genomewidelinelogpv <- -log10(9e-8) #FALSE #
+manhattan(CpGpvalue,main = "Manhattan Plot of association p-values", annotatePval = qv0.1pv, annotateTop = TRUE, suggestiveline=suggestivelinelogpv, genomewideline = genomewidelinelogpv, cex.axis = 0.8, col = c("blue4", "orange3"))
+
+
+## enrichment analysis
+sigCpGs <- M1DMPs$Name[M1DMPs$adj.P.Val < 0.05]
+DMCbeta <- bVals[sigCpGs,]
+
+length(sigCpGs)
+# Get all the CpG sites used in the analysis to form the background
+all <- M1DMPs$Name
+# Total number of CpG sites tested
+
+par(mfrow=c(1,1))
+gst <- gometh(sig.cpg=sigCpGs, all.cpg=all, plot.bias=TRUE)
+# Top 10 GO categories
+topGSA(gst, number=10)
+
+gst.kegg <- gometh(sig.cpg=sigCpGs, all.cpg=all, array.type = "EPIC", 
+                   collection="KEGG", anno = annotation, 
+                   sig.genes =TRUE, plot.bias=TRUE)
+# Top 10 GO categories
+topGSA(gst.kegg, number=10)
+
+
+## additional larger set with adjusted p-value < 0.25
+sigCpGs <- M1DMPs$Name[M1DMPs$adj.P.Val <0.25]
+length(sigCpGs)
+# Get all the CpG sites used in the analysis to form the background
+
+par(mfrow=c(1,1))
+gst <- gometh(sig.cpg=sigCpGs, all.cpg=all, plot.bias=TRUE)
+# Top 10 GO categories
+topGSA(gst, number=10)
+
+gst.kegg <- gometh(sig.cpg=sigCpGs, all.cpg=all, array.type = "EPIC", 
+                   collection="KEGG", anno = annotation, 
+                   sig.genes =TRUE, plot.bias=TRUE)
+# Top 10 GO categories
+topGSA(gst.kegg, number=10)
+
+## use top 20% variable CpGs as the background
+mVals_sd <- rowSds(mVals)
+Top20CpGs <- names(mVals_sd[mVals_sd > quantile(mVals_sd,0.8)])
+
+gst.top20 <- gometh(sig.cpg=sigCpGs, all.cpg=Top20CpGs, plot.bias=TRUE)
+# Top 10 GO categories
+topGSA(gst.top20, number=10)
+
+gst.kegg.top20 <- gometh(sig.cpg=sigCpGs, all.cpg=Top20CpGs, array.type = "EPIC", 
+                   collection="KEGG", anno = annotation, 
+                   sig.genes =TRUE, plot.bias=TRUE)
+# Top 10 GO categories
+topGSA(gst.kegg.top20, number=10)
+```
+
+## Model1 DMRcate - Differential methylation analysis of regions with default parameters
+```{r model1 DMRcate detection}
+myAnnotation <- cpg.annotate(object = mVals, datatype = "array", what = "M", 
+                             analysis.type = "differential", design = design, 
+                             contrasts = TRUE, cont.matrix = contMatrix, 
+                             coef = "DLBCtrlDLB - DLBCtrlCtrl", 
+                             arraytype = "EPIC" )
+
+start_time <- Sys.time()
+DMRs <- dmrcate(myAnnotation, lambda=1000, C=2, min.cpgs=3)
+results.ranges <- extractRanges(DMRs)
+results.ranges
+Sys.time() - start_time
+
+## change the FDR threshold to < 0.1
+myAnnotation <- changeFDR(myAnnotation, 0.1)
+
+DMRs <- dmrcate(myAnnotation, lambda=1000, C=2, min.cpgs=3)
+results.ranges <- extractRanges(DMRs)
+results.ranges
+
+## change the FDR threshold to < 0.25
+myAnnotation <- changeFDR(myAnnotation, 0.25)
+
+start_time <- Sys.time()
+DMRs <- dmrcate(myAnnotation, lambda=1000, C=2, min.cpgs=3)
+results.ranges25 <- extractRanges(DMRs)
+results.ranges25
+Sys.time() - start_time
+
+out <- cbind(seqnames(results.ranges25), start(results.ranges25)-1,
+  end(results.ranges25), mcols(results.ranges25))
+
+# set up the grouping variables and colours
+pal <- brewer.pal(8,"Dark2")
+groups <- pal[1:length(unique(targets$Sample_Group))]
+names(groups) <- levels(factor(targets$Sample_Group))
+cols <- groups[as.character(factor(targets$Sample_Group))]
+
+gst.region <- goregion(results.ranges25, all.cpg=rownames(bVals), 
+                       collection="GO", array.type="EPIC", sig.genes =TRUE, plot.bias=TRUE)
+
+topGSA(gst.region, n=10)
+
+gst.region.kegg <- goregion(results.ranges25, all.cpg=rownames(bVals), sig.genes =TRUE,
+                       collection="KEGG", array.type="EPIC")
+topGSA(gst.region.kegg, n=10)
+
+```
+
+### Plot the top signals
+```{r plot the top signals for the DMCs}
+library(data.table)
+library(ggplot2)
+library(cowplot)
+
+sigCpGs <- M1DMPs$Name[M1DMPs$adj.P.Val <0.05]
+DMCbeta <- bVals[sigCpGs,]
+
+CpGs <- sigCpGs[1:4] ; 
+# combine plots into one big panel 
+# https://cran.r-project.org/web/packages/cowplot/vignettes/introduction.html
+### repeat the plots for 4 CpGs.   
+sex.f = factor(targets$Gender, levels=c(0,1), labels = c("Female", "Male"))
+
+DMCprofile <- data.frame(meth = DMCbeta[CpGs[1],], 
+                         group = targets$Sample_Group, 
+                         Sex = sex.f)
+# Change stripchart colors by groups
+p1 <- ggplot(DMCprofile, aes(x=group, y=meth, color=Sex)) +
+  labs(x = "Group", y="Beta value") +  labs(title = CpGs[1]) +
+  geom_jitter(position=position_jitter(0.2), size = 2)
+
+DMCprofile <- data.frame(meth = DMCbeta[CpGs[2],], 
+                         group = targets$Sample_Group, 
+                         Sex = sex.f)
+# Change stripchart colors by groups
+p2 <- ggplot(DMCprofile, aes(x=group, y=meth, color=Sex)) +
+  labs(x = "Group", y="Beta value") +  labs(title = CpGs[2]) +
+  geom_jitter(position=position_jitter(0.2), size = 2)
+
+DMCprofile <- data.frame(meth = DMCbeta[CpGs[3],], 
+                         group = targets$Sample_Group, 
+                         Sex = sex.f)
+# Change stripchart colors by groups
+p3 <- ggplot(DMCprofile, aes(x=group, y=meth, color=Sex)) +
+  labs(x = "Group", y="Beta value") +  labs(title = CpGs[3]) +
+  geom_jitter(position=position_jitter(0.2), size = 2)
+
+DMCprofile <- data.frame(meth = DMCbeta[CpGs[4],], 
+                         group = targets$Sample_Group, 
+                         Sex = sex.f)
+# Change stripchart colors by groups
+p4 <- ggplot(DMCprofile, aes(x=group, y=meth, color=Sex)) +
+  labs(x = "Group", y="Beta value") +  labs(title = CpGs[4]) +
+  geom_jitter(position=position_jitter(0.2), size = 2)
+
+plot_grid(p1, p2, p3, p4, labels = c('(A)', '(B)', "(C)", "(D)"), label_size = 12)
+
+```
+
+### The heatmap plot of DMCs
+```{r ComplexHeatmap plot for the delta methylation}
+library(ComplexHeatmap)
+library(circlize)
+library(GetoptLong)
+library(RColorBrewer)
+
+####
+# Define colors for each levels of qualitative variables
+# Define gradient color for continuous variable 
+col = list( SEX = c("M" = "lightblue", "F" = "pink"),
+            AGE = circlize::colorRamp2(c(65, 100), 
+                                       c("lightblue", "purple")),
+            PMI = circlize::colorRamp2(c(15, 95), 
+                                       c("green", "red")),
+            STATUS =c("Ctrl" = "grey", "DLB" = "darkred")  )
+
+# Create the heatmap annotation
+
+ha <- HeatmapAnnotation(
+  SEX = ifelse(targets$Gender == 1, "M", "F"),
+  AGE = targets$Age*100,
+  PMI = targets$PMI*100,
+  STATUS = targets$Sample_Group, 
+  col = col
+)
+sigCpGs <- M1DMPs$Name[M1DMPs$adj.P.Val <0.05]
+DMCbeta <- bVals[sigCpGs,]
+
+ht<-Heatmap(DMCbeta, name = "Meth",
+        show_row_names = FALSE,
+        top_annotation = ha)
+
+print(ht)
+
+
+sigCpGs <- M1DMPs$Name[M1DMPs$adj.P.Val <0.1]
+DMCbeta <- bVals[sigCpGs,]
+
+ht<-Heatmap(DMCbeta, name = "Meth",
+        show_row_names = FALSE, 
+        top_annotation = ha)
+
+print(ht)
+
+
+# sigCpGs <- M1DMPs$Name[M1DMPs$adj.P.Val <0.25]
+# DMCbeta <- bVals[sigCpGs,]
+# 
+# ht<-Heatmap(DMCbeta, name = "Meth",
+#         show_row_names = FALSE,
+#         top_annotation = ha)
+# print(ht)
+
+```
+
+## Model1 beta : beta-value based DMC analysis
+```{r model1 beta: beta value based limma - INCPCs + NeuN_noob}
+# this is the factor of interest
+DLBCtrl <- factor(targets$Sample_Group)
+
+nPCs <- 3
+INCPCs <- meth_INCsPCA$x[,1:nPCs] # from the scree plot, let's pick the top 3 INC PCs.
+
+pheno <- cbind(targets, INCPCs)
+colnames(pheno) <- c(colnames(targets), paste("INCPCs", c(1:nPCs), sep=""))
+INCPCs <- as.matrix(INCPCs)
+
+# use the above to create a design matrix
+design <- model.matrix(~ 0 + DLBCtrl + Age + Gender + PMI +  NeuN_pos_noob + NeuN_neg_noob + INCPCs, data = pheno)
+
+# fit the linear model 
+model1beta.fit <- lmFit(bVals, design) # use mVals from Fun normalization
+#fit <- lmFit(Mval, design)
+
+# create a contrast matrix for specific comparisons
+contMatrix <- makeContrasts(DLBCtrlDLB - DLBCtrlCtrl ,
+                           levels=design)
+contMatrix
+
+# fit the contrasts
+start_time <- Sys.time()
+model1beta.fit2 <- contrasts.fit(model1beta.fit, contMatrix)
+model1beta.fit2 <- eBayes(model1beta.fit2)
+Sys.time() - start_time
+
+# look at the numbers of DM CpGs at FDR < 0.05 
+summary(decideTests(model1beta.fit2, p.value=0.05))
+
+## calculate the genomic inflation lambdagc
+chisq <- qchisq(1-model1beta.fit2 $p.value,1)
+lambdagc <- round(median(chisq)/qchisq(0.5,1),2)
+lambdagc
+
+
+# get the table of results for the first contrast (DLB - Ctrl)
+annEPICSub <- annEPIC[match(rownames(bVals),annEPIC$Name),
+                      c(1:4,12:19,24:ncol(annEPIC))]
+
+M1betaDMPs <- topTable(model1beta.fit2, num=Inf, coef=1, genelist=annEPICSub)
+head(M1betaDMPs)
+sum(M1betaDMPs$P.Value <9e-8)
+sum(M1betaDMPs$P.Value <1e-5)
+
+## cor(-log10(M1DMPs$P.Value), -log10(M1betaDMPs[M1DMPs$Name,]$P.Value)) 
+## plot(-log10(M1DMPs$P.Value),  -log10(M1betaDMPs[M1DMPs$Name,]$P.Value),pch=".", xlab="-log10(p-value of mValue model)", ylab="-log10(p-value of betaValue model)", xlim=c(0,9), ylim=c(0,9))
+## abline(coef = c(0,1),lty=2)
+
+##
+# ## manhattan plot
+# CHR <- M1betaDMPs$chr
+# CHR <-  gsub("^.{0,3}", "", CHR)
+# CHR <- as.numeric(CHR)
+# CpGpvalue <-
+#   data.frame(
+#     SNP = M1betaDMPs$Name,
+#     CHR = CHR,
+#     BP = M1betaDMPs$pos,
+#     P = M1betaDMPs$P.Value
+#   )
+# 
+
+# #pngFile <- "DLBvsCtrl.beta.qqplot.manhattan.topsignals.plot.png"
+# #png(pngFile,width=8,heigh=4,units="in",res=300)
+# par(mfrow=c(1,2))
+
+# ## plot the qqplot of p-values
+# qq(model1beta.fit2$p.value, col = "blue4",cex = 0.8, las = 1, main = "Q-Q plot of association p-values")
+# 
+# suggestivelinelogpv <- -log10(1.02e-6)
+# genomewidelinelogpv <- FALSE #-log10(9e-8)
+# manhattan(CpGpvalue,main = "Manhattan Plot of association p-values", annotatePval = 5.5e-6, annotateTop = TRUE, suggestiveline=suggestivelinelogpv, genomewideline = genomewidelinelogpv, cex.axis = 0.8, col = c("blue4", "orange3"))
+# #dev.off()
+
+# sigCpGs <- M1betaDMPs$Name[M1betaDMPs$adj.P.Val <0.05]
+# 
+# DMCbeta <- bVals[sigCpGs,]
+# 
+# length(sigCpGs)
+# # Get all the CpG sites used in the analysis to form the background
+# all <- M1betaDMPs$Name
+# # Total number of CpG sites tested
+# 
+# par(mfrow=c(1,1))
+# gst <- gometh(sig.cpg=sigCpGs, all.cpg=all, plot.bias=TRUE)
+# # Top 10 GO categories
+# topGSA(gst, number=10)
+# 
+# gst.kegg <- gometh(sig.cpg=sigCpGs, all.cpg=all, array.type = "EPIC", 
+#                    collection="KEGG", anno = annotation, 
+#                    sig.genes =TRUE, plot.bias=TRUE)
+# # Top 10 GO categories
+# topGSA(gst.kegg, number=10)
+
+## additional larger set
+sigCpGs <- M1betaDMPs$Name[M1betaDMPs$adj.P.Val <0.25]
+
+length(sigCpGs)
+# Get all the CpG sites used in the analysis to form the background
+
+par(mfrow=c(1,1))
+gst <- gometh(sig.cpg=sigCpGs, all.cpg=all, plot.bias=TRUE)
+# Top 10 GO categories
+topGSA(gst, number=10)
+
+gst.kegg <- gometh(sig.cpg=sigCpGs, all.cpg=all, array.type = "EPIC", 
+                   collection="KEGG", anno = annotation, 
+                   sig.genes =TRUE, plot.bias=TRUE)
+# Top 10 GO categories
+topGSA(gst.kegg, number=10)
+
+```
+
+## Model beta DMRcate - Differential methylation analysis of regions with default parameters
+```{r model1 beta DMRcate DMR detection}
+## DMRcate - Differential methylation analysis of regions with default parameters
+myAnnotation <- cpg.annotate(object = bVals, datatype = "array", what = "Beta", 
+                             analysis.type = "differential", design = design, 
+                             contrasts = TRUE, cont.matrix = contMatrix, 
+                             coef = "DLBCtrlDLB - DLBCtrlCtrl", 
+                             arraytype = "EPIC" )
+
+start_time <- Sys.time()
+DMRs <- dmrcate(myAnnotation, lambda=1000, C=2, min.cpgs=3)
+results.ranges.beta <- extractRanges(DMRs)
+results.ranges.beta
+Sys.time() - start_time
+
+## Differential methylation analysis of regions with DMC of fdr < 0.1
+myAnnotation <- changeFDR(myAnnotation, 0.1)
+DMRs <- dmrcate(myAnnotation, lambda=1000, C=2, min.cpgs=3)
+results.ranges.beta <- extractRanges(DMRs)
+results.ranges.beta
+
+myAnnotation <- changeFDR(myAnnotation, 0.25)
+
+start_time <- Sys.time()
+DMRs <- dmrcate(myAnnotation, lambda=1000, C=2, min.cpgs=3)
+results.ranges.beta <- extractRanges(DMRs)
+results.ranges.beta
+Sys.time() - start_time
+
+# set up the grouping variables and colours
+groups <- pal[1:length(unique(targets$Sample_Group))]
+names(groups) <- levels(factor(targets$Sample_Group))
+cols <- groups[as.character(factor(targets$Sample_Group))]
+
+
+gst.region <- goregion(results.ranges.beta, all.cpg=rownames(bVals), 
+                       collection="GO", array.type="EPIC", sig.genes =TRUE, plot.bias=TRUE)
+
+topGSA(gst.region, n=10)
+
+gst.region.kegg <- goregion(results.ranges.beta, all.cpg=rownames(bVals), sig.genes =TRUE,
+                       collection="KEGG", array.type="EPIC")
+topGSA(gst.region.kegg, n=10)
+
+```
+
+The following is the results from the model without neuron proportion correction.
+
+## Model2 : M-value based DMC analysis without neuronal proportion correction
+```{r model 2 - no neuronal proportion correction}
+# this is the factor of interest
+DLBCtrl <- factor(targets$Sample_Group)
+
+nPCs <- 3
+INCPCs <- meth_INCsPCA$x[,1:nPCs] # from the scree plot, let's pick the top 3 INC PCs.
+
+pheno <- cbind(targets, INCPCs)
+colnames(pheno) <- c(colnames(targets), paste("INCPCs", c(1:nPCs), sep=""))
+INCPCs <- as.matrix(INCPCs)
+
+# use the above to create a design matrix
+design <- model.matrix(~ 0 + DLBCtrl + Age + Gender + PMI +  INCPCs, data = pheno)
+
+# fit the linear model 
+model2.fit <- lmFit(mVals, design) # use mVals from Fun normalization
+#fit <- lmFit(Mval, design)
+
+# create a contrast matrix for specific comparisons
+contMatrix <- makeContrasts(DLBCtrlDLB - DLBCtrlCtrl ,
+                           levels=design)
+contMatrix
+
+# fit the contrasts
+start_time <- Sys.time()
+model2.fit2 <- contrasts.fit(model2.fit, contMatrix)
+model2.fit2 <- eBayes(model2.fit2)
+Sys.time() - start_time
+
+# look at the numbers of DM CpGs at FDR < 0.01 
+summary(decideTests(model2.fit2 ,p.value=0.01))
+
+## calculate the genomic inflation lambdagc
+chisq <- qchisq(1-model2.fit2 $p.value,1)
+lambdagc <- round(median(chisq)/qchisq(0.5,1),2)
+lambdagc
+
+# get the table of results for the first contrast (DLB - Ctrl)
+annEPICSub <- annEPIC[match(rownames(mVals),annEPIC$Name),
+                      c(1:4,12:19,24:ncol(annEPIC))]
+M2DMPs <- topTable(model2.fit2, num=Inf, coef=1, genelist=annEPICSub)
+head(M2DMPs)
+
+## cor(-log10(M1DMPs$P.Value), -log10(M2DMPs[M1DMPs$Name,]$P.Value)) #
+## plot(-log10(M1DMPs$P.Value),  -log10(M2DMPs[M1DMPs$Name,]$P.Value),pch=".", xlab="-log10(p-value of mValue model with NeuN proportion correction)", ylab="-log10(p-value of mValue model without NeuN proportion correction)", xlim=c(0,9), ylim=c(0,9))
+## abline(coef = c(0,1),lty=2)
+
+sigCpGs <- M2DMPs$Name[M2DMPs$adj.P.Val <0.25 ]
+length(sigCpGs)
+
+# Get all the CpG sites used in the analysis to form the background
+all <- M2DMPs$Name
+# Total number of CpG sites tested
+
+par(mfrow=c(1,1))
+gst <- gometh(sig.cpg=sigCpGs, all.cpg=all, plot.bias=TRUE)
+# Top 10 GO categories
+topGSA(gst, number=10)
+
+gst.kegg <- gometh(sig.cpg=sigCpGs, all.cpg=all, array.type = "EPIC", 
+                   collection="KEGG", anno = annotation, 
+                   sig.genes =TRUE, plot.bias=TRUE)
+# Top 10 GO categories
+topGSA(gst.kegg, number=10)
+
+# Model2 DMRcate Differential methylation analysis of regions
+myAnnotation <- cpg.annotate(object = mVals, datatype = "array", what = "M", 
+                             analysis.type = "differential", design = design, 
+                             contrasts = TRUE, cont.matrix = contMatrix, 
+                             coef = "DLBCtrlDLB - DLBCtrlCtrl", 
+                             arraytype = "EPIC")
+#endif /* NEWSTUFF */
+start_time <- Sys.time()
+DMRs <- dmrcate(myAnnotation, lambda=1000, C=2)
+results.ranges2 <- extractRanges(DMRs)
+results.ranges2
+Sys.time() - start_time
+
+```
+
+## Model3: the M-value model with neuron proportion correction (inferred by CIBERSORTx).
+```{r model3 CIBERSORTx estimated Neuron proportion correction}
+
+library(data.table)
+NeuNproportion <- fread("./CIBERSORTproportions/CIBERSORTx_noQN.proportion.txt",data.table=F)
+targets$NeuN_N <- NeuNproportion[,"NeuN_N"]
+targets$NeuN_G <- NeuNproportion[,"NeuN_G"]
+#targets
+
+DLBCtrl <- factor(targets$Sample_Group)
+
+nPCs <- 3
+INCPCs <- meth_INCsPCA$x[,1:nPCs] # from the scree plot, let's pick the top 3 INC PCs.
+
+pheno <- cbind(targets, INCPCs)
+colnames(pheno) <- c(colnames(targets), paste("INCPCs", c(1:nPCs), sep=""))
+INCPCs <- as.matrix(INCPCs)
+
+# use the above to create a design matrix
+design <- model.matrix(~ 0 + DLBCtrl + Age + Gender + PMI + NeuN_N + INCPCs, data = pheno)
+
+# fit the linear model 
+model3.fit <- lmFit(mVals, design) # use mVals from Fun normalization
+
+# create a contrast matrix for specific comparisons
+contMatrix <- makeContrasts(DLBCtrlDLB - DLBCtrlCtrl ,
+                           levels=design)
+contMatrix
+
+# fit the contrasts
+start_time <- Sys.time()
+model3.fit2 <- contrasts.fit(model3.fit, contMatrix)
+model3.fit2 <- eBayes(model3.fit2)
+Sys.time() - start_time
+
+# look at the numbers of DM CpGs at FDR < 0.05 
+summary(decideTests(model3.fit2, p.value=0.05))
+
+## calculate the genomic inflation lambdagc
+chisq <- qchisq(1-model3.fit2 $p.value,1)
+lambdagc <- round(median(chisq)/qchisq(0.5,1),2)
+lambdagc
+
+# get the table of results for the first contrast (DLB - Ctrl)
+annEPICSub <- annEPIC[match(rownames(mVals),annEPIC$Name),
+                      c(1:4,12:19,24:ncol(annEPIC))]
+M3DMPs <- topTable(model3.fit2, num=Inf, coef=1, genelist=annEPICSub)
+head(M3DMPs)
+sum(M3DMPs$P.Value <9e-8)
+sum(M3DMPs$P.Value <1e-5)
+
+## manhattan plot
+library(qqman)
+CHR <- M1DMPs$chr
+CHR <-  gsub("^.{0,3}", "", CHR)
+CHR <- as.numeric(CHR)
+CpGpvalue <-
+  data.frame(
+    SNP = M3DMPs$Name,
+    CHR = CHR,
+    BP = M3DMPs$pos,
+    P = M3DMPs$P.Value
+  )
+colnames(CpGpvalue)=c("SNP", "CHR", "BP","P")
+
+qq(model3.fit2$p.value, col = "blue4",cex = 0.8, las = 1, main = "Q-Q plot of association p-values")
+
+qv0.1pv <- max (M3DMPs$P.Value[M3DMPs$adj.P.Val<0.1])
+qv0.05pv <- max(M3DMPs$P.Value[M3DMPs$adj.P.Val<0.05])
+
+suggestivelinelogpv <- -log10(qv0.05pv) 
+genomewidelinelogpv <- -log10(9e-8) #FALSE #
+manhattan(CpGpvalue,main = "Manhattan Plot of association p-values", annotatePval = qv0.1pv, annotateTop = TRUE, suggestiveline=suggestivelinelogpv, genomewideline = genomewidelinelogpv, cex.axis = 0.8, col = c("blue4", "orange3"))
+
+# ## 
+# cor(-log10(M1DMPs$P.Value), -log10(M3DMPs[M1DMPs$Name, ]$P.Value))
+# plot(-log10(M1DMPs$P.Value), -log10(M3DMPs[M1DMPs$Name, ]$P.Value), pch=".",
+#      xlab="-log10(p-value of M1 model)",
+#      ylab="-log10(p-value of M3 model)", xlim = c(0,8), ylim=c(0,8))
+# abline(coef = c(0,1),lty=2)
+
+## enrichment analysis
+sigCpGs <- M3DMPs$Name[M3DMPs$adj.P.Val < 0.05]
+
+length(sigCpGs)
+# Get all the CpG sites used in the analysis to form the background
+all <- M3DMPs$Name
+# Total number of CpG sites tested
+
+par(mfrow=c(1,1))
+gst <- gometh(sig.cpg=sigCpGs, all.cpg=all, plot.bias=TRUE)
+# Top 10 GO categories
+topGSA(gst, number=10)
+
+gst.kegg <- gometh(sig.cpg=sigCpGs, all.cpg=all, array.type = "EPIC", 
+                   collection="KEGG", anno = annotation, 
+                   sig.genes =TRUE, plot.bias=TRUE)
+# Top 10 GO categories
+topGSA(gst.kegg, number=10)
+
+## additional larger set with adjusted p-value < 0.25
+sigCpGs <- M3DMPs$Name[M3DMPs$adj.P.Val <0.25]
+length(sigCpGs)
+# Get all the CpG sites used in the analysis to form the background
+
+par(mfrow=c(1,1))
+gst <- gometh(sig.cpg=sigCpGs, all.cpg=all, plot.bias=TRUE)
+# Top 10 GO categories
+topGSA(gst, number=10)
+
+gst.kegg <- gometh(sig.cpg=sigCpGs, all.cpg=all, array.type = "EPIC", 
+                   collection="KEGG", anno = annotation, 
+                   sig.genes =TRUE, plot.bias=TRUE)
+# Top 10 GO categories
+topGSA(gst.kegg, number=10)
+
+## use top 20% variable CpGs as the background
+gst.top20 <- gometh(sig.cpg=sigCpGs, all.cpg=Top20CpGs, plot.bias=TRUE)
+# Top 10 GO categories
+topGSA(gst.top20, number=10)
+
+gst.kegg.top20 <- gometh(sig.cpg=sigCpGs, all.cpg=Top20CpGs, array.type = "EPIC", 
+                   collection="KEGG", anno = annotation, 
+                   sig.genes =TRUE, plot.bias=TRUE)
+# Top 10 GO categories
+topGSA(gst.kegg.top20, number=10)
+
+```
+
+## Model4-1 : Top 2 INCPCs + NeuN_noob
+```{r model 4-1: top 2 INCPCs + NeuN_noob}
+# this is the factor of interest
+DLBCtrl <- factor(targets$Sample_Group)
+
+nPCs <- 2
+INCPCs <- meth_INCsPCA$x[,1:nPCs] # from the scree plot, let's pick the top 3 INC PCs.
+
+pheno <- cbind(targets, INCPCs)
+colnames(pheno) <- c(colnames(targets), paste("INCPCs", c(1:nPCs), sep=""))
+INCPCs <- as.matrix(INCPCs)
+
+# use the above to create a design matrix
+design <- model.matrix(~ 0 + DLBCtrl + Age + Gender + PMI + NeuN_pos_noob + INCPCs, data = pheno)
+
+# fit the linear model 
+model4.fit <- lmFit(mVals, design) # use mVals from Fun normalization
+
+# create a contrast matrix for specific comparisons
+contMatrix <- makeContrasts(DLBCtrlDLB - DLBCtrlCtrl ,
+                           levels=design)
+contMatrix
+
+# fit the contrasts
+start_time <- Sys.time()
+model4.fit2 <- contrasts.fit(model4.fit, contMatrix)
+model4.fit2 <- eBayes(model4.fit2)
+Sys.time() - start_time
+
+#plotMD(model4.fit2,column=1)
+#volcanoplot(model4.fit2,coef=1,highlight=2)
+
+summary(decideTests(model4.fit2, p.value=0.05))
+
+## calculate the genomic inflation lambdagc
+chisq <- qchisq(1-model4.fit2 $p.value,1)
+m4.lambdagc <- round(median(chisq)/qchisq(0.5,1),2)
+m4.lambdagc
+
+```
+
+## Model4-2 : Top 4 INCPCs + NeuN_noob
+```{r model 4-2: top 4 INCPCs + NeuN_noob}
+# this is the factor of interest
+DLBCtrl <- factor(targets$Sample_Group)
+
+nPCs <- 4
+INCPCs <- meth_INCsPCA$x[,1:nPCs] # from the scree plot, let's pick the top 3 INC PCs.
+
+pheno <- cbind(targets, INCPCs)
+colnames(pheno) <- c(colnames(targets), paste("INCPCs", c(1:nPCs), sep=""))
+INCPCs <- as.matrix(INCPCs)
+
+# use the above to create a design matrix
+design <- model.matrix(~ 0 + DLBCtrl + Age + Gender + PMI + NeuN_pos_noob + INCPCs, data = pheno)
+
+# fit the linear model 
+model4.fit <- lmFit(mVals, design) # use mVals from Fun normalization
+
+# create a contrast matrix for specific comparisons
+contMatrix <- makeContrasts(DLBCtrlDLB - DLBCtrlCtrl ,
+                           levels=design)
+
+# fit the contrasts
+start_time <- Sys.time()
+model4.fit2 <- contrasts.fit(model4.fit, contMatrix)
+model4.fit2 <- eBayes(model4.fit2)
+Sys.time() - start_time
+
+#plotMD(model4.fit2,column=1)
+#volcanoplot(model4.fit2,coef=1,highlight=2)
+
+summary(decideTests(model4.fit2, p.value=0.05))
+
+## calculate the genomic inflation lambdagc
+chisq <- qchisq(1-model4.fit2 $p.value,1)
+m4.lambdagc <- round(median(chisq)/qchisq(0.5,1),2)
+m4.lambdagc
+
+```
+<!-- ## Plot top DMRs from Model1: PAK6  -->
+<!-- ```{r Gvix plot for PAK6 DMR} -->
+<!-- # indicate which genome is being used -->
+<!-- gen <- "hg19" -->
+<!-- # the index of the DMR that we will plot  -->
+<!-- dmrIndex <- 1 -->
+<!-- # extract chromosome number and location from DMR results  -->
+<!-- chrom <- as.character(seqnames(results.ranges[dmrIndex])) -->
+<!-- start <- as.numeric(start(results.ranges[dmrIndex])) -->
+<!-- end <- as.numeric(end(results.ranges[dmrIndex])) -->
+<!-- # add 25% extra space to plot -->
+<!-- minbase <- start - (0.25*(end-start)) -->
+<!-- maxbase <- end + (0.25*(end-start)) -->
+
+<!-- # # CpG islands -->
+<!-- cpgIslands <- UcscTrack(genome = gen, chromosome = chrom,  -->
+<!--                         track = "cpgIslandExt", from = minbase, to = maxbase, -->
+<!--                         trackType = "AnnotationTrack",  -->
+<!--                         start = "chromStart", end = "chromEnd",  -->
+<!--                         id = "name", shape = "box", fill = "#006400",  -->
+<!--                         name = "CpG Islands") -->
+
+<!-- # Chromatin HMM status -->
+<!-- chromHMM <- read.csv(paste0(dataDirectory,"../../../ChromHMMstates_Brain/E073_15_coreMarks_segments.BrainDorsolateralPrefrontalCortex.bed"), -->
+<!--                   sep="\t",stringsAsFactors=FALSE,header=FALSE) -->
+<!-- #head(chromHMM) -->
+
+<!-- ## this is kind of manual annotated chromatin status - need to be updated case by case. -->
+<!-- chromHMM15 <- chromHMM[chromHMM$V1==chrom & chromHMM$V2 >= minbase & chromHMM$V3 <=maxbase,] -->
+
+<!-- chromHMMData <- GRanges(seqnames=chromHMM15[,1], -->
+<!--                      ranges=IRanges(start=chromHMM15[,2], end=chromHMM15[,3]), -->
+<!--                      strand=Rle(rep("*",nrow(chromHMM15))), -->
+<!--                      data=chromHMM15[,4]) -->
+<!-- # chromHMMData -->
+<!-- # set up the ideogram, genome and RefSeq tracks that will provide context for our methylation data. -->
+
+<!-- iTrack <- IdeogramTrack(genome = gen, chromosome = chrom) #, name="" -->
+<!-- chromosome(iTrack) <- chrom -->
+
+<!-- gTrack <- GenomeAxisTrack(col="black", cex=1, name="", fontcolor="black") -->
+<!-- rTrack <- UcscTrack(genome=gen, chromosome=chrom, track="NCBI RefSeq",  -->
+<!--                     from=minbase, to=maxbase, trackType="GeneRegionTrack",  -->
+<!--                     rstarts="exonStarts", rends="exonEnds", gene="name",  -->
+<!--                     symbol="name2", transcript="name", strand="strand",  -->
+<!--                     fill="darkblue",stacking="squish", name="RefSeq",  -->
+<!--                     showId=TRUE, geneSymbol=TRUE) -->
+
+<!-- annEPICOrd <- annEPICSub[order(annEPICSub$chr,annEPICSub$pos),] -->
+<!-- #head(annEPICOrd) -->
+
+<!-- bValsOrd <- bVals[match(annEPICOrd$Name,rownames(bVals)),] -->
+<!-- #head(bValsOrd) -->
+
+<!-- # create genomic ranges object from methylation data -->
+<!-- cpgData <- GRanges(seqnames=Rle(annEPICOrd$chr), -->
+<!--                    ranges=IRanges(start=annEPICOrd$pos, end=annEPICOrd$pos), -->
+<!--                    strand=Rle(rep("*",nrow(annEPICOrd))), -->
+<!--                    betas=bValsOrd) -->
+<!-- # extract data on CpGs in DMR -->
+<!-- cpgData <- subsetByOverlaps(cpgData, results.ranges[dmrIndex]) -->
+
+<!-- # methylation data track -->
+<!-- methTrack <- DataTrack(range=cpgData, groups=targets$Sample_Group,genome = gen, -->
+<!--                        chromosome=chrom, ylim=c(-0.05,0.6), col=pal, -->
+<!--                        type=c("a","p"), name="DNA Meth.\n(beta value)", -->
+<!--                        background.panel="white", legend=TRUE, cex.title=0.8, -->
+<!--                        cex.axis=0.8, cex.legend=0.8) -->
+
+<!-- # # DNaseI hypersensitive site data track -->
+<!-- chromHMMTrack <- AnnotationTrack(range=chromHMMData, genome=gen,  -->
+<!--                                  name="ChromatinHMM", chromosome=chrom, -->
+<!--                                  showFeatureId =TRUE,fontcolor.exon = 1, -->
+<!--                                  feature= c("ReprPC", "TssAFlnk", "TssBiv", "BivFlnk")) -->
+<!-- #feature(chromHMMTrack) <- c("ReprPC", "TssAFlnk", "TssBiv", "BivFlnk") -->
+
+<!-- # DMR position data track -->
+<!-- dmrTrack <- AnnotationTrack(start=start, end=end, genome=gen, name="DMR",  -->
+<!--                             chromosome=chrom,fill="darkred") -->
+
+<!-- tracks <- list(iTrack, gTrack, methTrack, cpgIslands,chromHMMTrack, dmrTrack, rTrack) -->
+<!-- sizes <- c(0.5,2,5,1,2,1,2) # set up the relative sizes of the tracks -->
+<!-- plotTracks(tracks, from=minbase, to=maxbase, showTitle=TRUE, add53=TRUE,  -->
+<!--            add35=TRUE, grid=TRUE, lty.grid=3, sizes = sizes,  length(tracks)) -->
+
+<!-- ``` -->
+
+```{r CpG sd distribution}
+beta_sd <- rowSds(bVals)
+quantile(beta_sd, c(0.80,0.90,0.95,0.99))
+
+mVals_sd <- rowSds(mVals)
+quantile(mVals_sd, c(0.80,0.90,0.95,0.99))
+
+### qv<0.05 and qv<0.25
+DMCCpGName <-  M1DMPs$Name[M1DMPs$adj.P.Val <0.05]
+DMC25CpGName <-  M1DMPs$Name[M1DMPs$adj.P.Val <0.25]
+
+top1 <- beta_sd > quantile(beta_sd,0.99)
+top5 <- beta_sd > quantile(beta_sd,0.95)
+top10 <- beta_sd > quantile(beta_sd,0.9)
+top20 <- beta_sd > quantile(beta_sd,0.8)
+
+CpG_class <- c(rep("qv<0.05 DMC", length(DMCCpGName)),
+               rep("qv<0.25 DMC", length(DMC25CpGName)),
+               rep("Top1% Sd CpGs", sum(top1)),
+               rep("Top5% Sd CpGs", sum(top5)),
+               rep("Top10% Sd CpGs", sum(top10)),
+               rep("Top20% Sd CpGs", sum(top20)),
+               rep("Other CpGs", sum(!top20))
+               )
+meth_sd <- c(beta_sd [DMCCpGName], 
+             beta_sd [DMC25CpGName],
+             beta_sd[top1],
+             beta_sd[top5],
+             beta_sd[top10],
+             beta_sd[top20],
+             beta_sd[!top20]
+             )
+DMCdf <- data.frame(
+  CpGtype=factor(CpG_class,levels = c("qv<0.05 DMC",
+                                      "qv<0.25 DMC",
+                                      "Top1% Sd CpGs",
+                                      "Top5% Sd CpGs",
+                                      "Top10% Sd CpGs",
+                                      "Top20% Sd CpGs", 
+                                      "Other CpGs")),
+  methSd=meth_sd
+  )
+
+p4 <- ggplot(DMCdf, aes(x=methSd, color=CpGtype)) +
+  geom_density() +
+  labs(title="Methylation SD distribution",x="Methylation SD", y = "Density")
+
+p4
+```
+
+<!-- ## Power analysis using pwrEWAS -->
+<!-- ```{r power analysis using pwrEWAS} -->
+<!-- library("pwrEWAS") -->
+
+<!-- ptm <- proc.time() -->
+<!-- results_targetDelta <- pwrEWAS(minTotSampleSize = 20, -->
+<!--     maxTotSampleSize = 60, -->
+<!--     SampleSizeSteps = 10, -->
+<!--     NcntPer = 0.5, -->
+<!--     targetDelta = c(0.1, 0.2, 0.3, 0.4), -->
+<!--     J = 800000, -->
+<!--     targetDmCpGs = 30, -->
+<!--     tissueType = "Adult (PBMC)", -->
+<!--     detectionLimit = 0.05, -->
+<!--     DMmethod = "limma", -->
+<!--     FDRcritVal = 0.05, -->
+<!--     core = 40, -->
+<!--     sims = 100) -->
+
+<!-- proc.time() - ptm -->
+
+<!-- pwrEWAS_powerPlot(results_targetDelta$powerArray, sd = FALSE) -->
+<!-- ``` -->
