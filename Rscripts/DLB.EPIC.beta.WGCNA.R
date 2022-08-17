@@ -9,15 +9,15 @@ print(commandIn)
 options(expressions = 500000)
 inFilename <- "betas_1.csv" # DNA methylation beta value matrix
 
-traits <- "Sample_Group,Gender,Age"
+traits <- "Sample_Group,Gender,Age,PMI,NeuN_neg,NeuN_pos"
 
-power.threshold <- 5 # predefined threshold 
+power.threshold <- 14 # predefined threshold 
 
 cutline <- 400000
 
 sd.top.quantile.cutoff <-
    0.95
-# over 80% quantile; i.e. top20% variable CpGs
+# over 95% quantile; i.e. top5% variable CpGs
 frac.subsample <- 1
 
 minFraction.threshold <- 1 / 2
