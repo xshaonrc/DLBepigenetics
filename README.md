@@ -1,7 +1,7 @@
 # DLBepigenetics
 Data analysis of DNA methylation EPIC array data in post-mortem brain tissue from DLB and control subjects.
 
-## Article: Epigenetic Analysis of DLB Brain Highlights Novel Genes Associated with Mood Disorders and Intelligence
+## Article: Dementia with Lewy bodies post-mortem brains reveal differentially methylated CpG sites with biomarker potential
 
 ### Xiaojian Shao et al. 2021. Under review at Nature Communications Biology.
 
