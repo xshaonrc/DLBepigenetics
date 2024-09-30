@@ -3,7 +3,7 @@ Data analysis of DNA methylation EPIC array data in post-mortem brain tissue fro
 
 ## Article: Dementia with Lewy bodies post-mortem brains reveal differentially methylated CpG sites with biomarker potential
 
-### Xiaojian Shao et al. 2022. Under review at Nature Communications Biology.
+### Xiaojian Shao et al. 2022. Communications Biology.
 
 ### Data : The Raw data have been deposited in NCBI's Gene Experssion Omnibus (GEO) and are accessiable throught GEO Series accession number : GSE190348.
 
